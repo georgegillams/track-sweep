@@ -1,0 +1,13 @@
+[package]
+name = "track-sweep"
+version = "0.1.0"
+edition = "2021"
+description = "CLI for quickly sorting and purging an Apple Music library"
+license = "MPL-2.0"
+
+[dependencies]
+anyhow = "1.0.104"
+crossterm = "0.29.0"
+ctrlc = "3.5.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
