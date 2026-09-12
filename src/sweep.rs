@@ -1,3 +1,4 @@
+use std::fs;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -10,6 +11,7 @@ use crate::progress::{self, progress_path, ProgressEntry};
 use crate::provider::{self, MusicProvider, ResumeCursor, TrackInfo};
 
 const SEEK_SECONDS: f64 = 30.0;
+const SEEK_MIN_DURATION_SECS: f64 = 60.0;
 
 pub fn run(provider: &dyn MusicProvider) -> Result<()> {
     let quit_flag = Arc::new(AtomicBool::new(false));
@@ -57,17 +59,19 @@ pub fn run(provider: &dyn MusicProvider) -> Result<()> {
         total - start
     );
     println!("Decisions append to {}.", decisions_path.display());
-    println!("Keys depend on each track (favourite vs unfavourite).\n");
+    println!("Keys depend on each track (favourite vs unfavourite). [b] goes back.\n");
 
     let keys = KeyReader::new(Arc::clone(&quit_flag))?;
+    let mut pos = start;
 
-    for (pos, entry) in order.iter().enumerate().skip(start) {
+    while pos < total {
         if quit_flag.load(Ordering::SeqCst) {
             let _ = provider.pause();
             raw_println("\nQuit. Progress saved; run again to resume.")?;
             return Ok(());
         }
 
+        let entry = &order[pos];
         let track = match provider.get_track(&entry.id) {
             Ok(t) => t,
             Err(err) => {
@@ -77,6 +81,8 @@ pub fn run(provider: &dyn MusicProvider) -> Result<()> {
                     total,
                     entry.id
                 ))?;
+                // Missing track: treat as completed and move forward (unless we came from back,
+                // still advance so we don't get stuck).
                 progress::save(
                     &path,
                     &ProgressEntry {
@@ -86,64 +92,96 @@ pub fn run(provider: &dyn MusicProvider) -> Result<()> {
                         artist: String::new(),
                     },
                 )?;
+                pos += 1;
                 continue;
             }
         };
 
-        let filter = ActionFilter::for_favorited(track.favorited);
+        let filter = ActionFilter::for_track(track.favorited, pos > 0);
         print_track(pos + 1, total, &track, &filter.key_help())?;
 
         provider
             .play_track(&track.id)
             .with_context(|| format!("play failed for {}", track.id))?;
 
-        let seek_to = if track.duration_secs > 0.0 && SEEK_SECONDS >= track.duration_secs {
-            (track.duration_secs - 1.0).max(0.0)
-        } else {
-            SEEK_SECONDS
-        };
-        std::thread::sleep(std::time::Duration::from_millis(250));
-        if let Err(err) = provider.seek(seek_to) {
-            raw_println(&format!("  (seek warning: {err})"))?;
+        if track.duration_secs > SEEK_MIN_DURATION_SECS {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            if let Err(err) = provider.seek(SEEK_SECONDS) {
+                raw_println(&format!("  (seek warning: {err})"))?;
+            }
         }
 
         let action = keys.wait_for_action(filter)?;
-        let decision = match action {
+        match action {
+            Action::Back => {
+                raw_println("  → back")?;
+                if pos == 0 {
+                    continue;
+                }
+                pos -= 1;
+                // Rewind progress so quit resumes on the track we're returning to.
+                rewind_progress(&path, &order, pos)?;
+                continue;
+            }
             Action::Remove => {
                 raw_println("  → remove")?;
                 provider.remove_from_library(&track.id)?;
-                Some(Decision::Remove)
+                decisions::append(&decisions_path, &track, Decision::Remove)?;
             }
             Action::Favourite => {
                 raw_println("  → favourite")?;
                 provider.set_favorited(&track.id, true)?;
-                Some(Decision::Favourite)
+                decisions::append(&decisions_path, &track, Decision::Favourite)?;
             }
             Action::Unfavourite => {
                 raw_println("  → unfavourite")?;
                 provider.set_favorited(&track.id, false)?;
-                Some(Decision::Unfavourite)
+                decisions::append(&decisions_path, &track, Decision::Unfavourite)?;
             }
             Action::Skip => {
                 raw_println("  → keep")?;
-                Some(Decision::Keep)
+                decisions::append(&decisions_path, &track, Decision::Keep)?;
             }
             Action::Quit => {
                 let _ = provider.pause();
                 raw_println("\nQuit. Run again to resume on this track.")?;
                 return Ok(());
             }
-        };
-
-        if let Some(decision) = decision {
-            decisions::append(&decisions_path, &track, decision)?;
-            progress::save(&path, &ProgressEntry::from_track(&track))?;
         }
+
+        progress::save(&path, &ProgressEntry::from_track(&track))?;
+        pos += 1;
     }
 
     let _ = provider.pause();
     raw_println("\nDone — reached the end of the library.")?;
     Ok(())
+}
+
+/// Set progress so resume starts at `current_pos` (last completed = prior track, or cleared).
+fn rewind_progress(
+    path: &std::path::Path,
+    order: &[ResumeCursor],
+    current_pos: usize,
+) -> Result<()> {
+    if current_pos == 0 {
+        if path.exists() {
+            fs::remove_file(path)
+                .with_context(|| format!("failed to clear {}", path.display()))?;
+        }
+        return Ok(());
+    }
+
+    let prev = &order[current_pos - 1];
+    progress::save(
+        path,
+        &ProgressEntry {
+            id: prev.id.clone(),
+            date_added: prev.date_added.clone(),
+            name: String::new(),
+            artist: String::new(),
+        },
+    )
 }
 
 fn raw_println(msg: &str) -> Result<()> {

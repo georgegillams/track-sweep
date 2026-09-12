@@ -13,6 +13,7 @@ pub enum Action {
     Favourite,
     Unfavourite,
     Skip,
+    Back,
     Quit,
 }
 
@@ -20,13 +21,15 @@ pub enum Action {
 pub struct ActionFilter {
     pub allow_favourite: bool,
     pub allow_unfavourite: bool,
+    pub allow_back: bool,
 }
 
 impl ActionFilter {
-    pub fn for_favorited(favorited: bool) -> Self {
+    pub fn for_track(favorited: bool, allow_back: bool) -> Self {
         Self {
             allow_favourite: !favorited,
             allow_unfavourite: favorited,
+            allow_back,
         }
     }
 
@@ -39,6 +42,9 @@ impl ActionFilter {
             parts.push("[n] unfavourite".to_string());
         }
         parts.push("[Space/Enter] keep".to_string());
+        if self.allow_back {
+            parts.push("[b] back".to_string());
+        }
         parts.push("[q] quit".to_string());
         parts.join("  ")
     }
@@ -83,6 +89,9 @@ impl KeyReader {
                             }
                             KeyCode::Char('n') | KeyCode::Char('N') if filter.allow_unfavourite => {
                                 return Ok(Action::Unfavourite);
+                            }
+                            KeyCode::Char('b') | KeyCode::Char('B') if filter.allow_back => {
+                                return Ok(Action::Back);
                             }
                             KeyCode::Char(' ') | KeyCode::Enter => return Ok(Action::Skip),
                             _ => {}

@@ -3,7 +3,7 @@
 CLI for quickly sorting and purging an Apple Music library on macOS.
 
 Walks your Music.app library from oldest to newest (by date added), plays each
-track starting at 0:30, and lets you remove, favourite, unfavourite, or skip —
+track starting at 0:30 when longer than 1 minute, and lets you remove, favourite, unfavourite, or skip —
 with resume via a local `./progress.json` file. A lightweight id/date index is
 built at startup (with progress), then each track’s full metadata is loaded
 only when it is played.
@@ -39,6 +39,7 @@ Shown options depend on the track:
 | `f` | Favourite (only if not already favourited) |
 | `n` | Unfavourite (only if currently favourited) |
 | `Space` / `Enter` | Keep (no library change) |
+| `b` | Go back to the previous track (repeatable) |
 | `q` / `Ctrl-C` | Quit (resume on current track next run) |
 
 Each decision is appended to `./decisions.csv`:
