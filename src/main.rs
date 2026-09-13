@@ -1,4 +1,6 @@
 mod decisions;
+mod disliked;
+mod index_cache;
 mod input;
 mod progress;
 mod provider;

@@ -4,9 +4,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use crossterm::style::Stylize;
 
 use crate::decisions::{self, Decision};
-use crate::input::{Action, ActionFilter, KeyReader};
+use crate::disliked::DislikedSet;
+use crate::index_cache;
+use crate::input::{self, Action, ActionFilter, CacheChoice, KeyReader};
 use crate::progress::{self, progress_path, ProgressEntry};
 use crate::provider::{self, MusicProvider, ResumeCursor, TrackInfo};
 
@@ -23,8 +26,16 @@ pub fn run(provider: &dyn MusicProvider) -> Result<()> {
         .context("failed to install Ctrl-C handler")?;
     }
 
-    // Index before enabling raw mode so progress lines stay readable.
-    let order = provider.list_library_order_oldest_first()?;
+    let mut disliked = DislikedSet::load()?;
+
+    // Index (or load cache) before enabling raw mode so progress lines stay readable.
+    let order = match load_or_build_index(provider, Arc::clone(&quit_flag))? {
+        Some(order) => order,
+        None => {
+            offer_delete_disliked(provider, None, Arc::clone(&quit_flag), &mut disliked)?;
+            return Ok(());
+        }
+    };
     if order.is_empty() {
         println!("Library is empty — nothing to sweep.");
         return Ok(());
@@ -50,6 +61,7 @@ pub fn run(provider: &dyn MusicProvider) -> Result<()> {
     let start = provider::resume_start_index(&order, cursor.as_ref());
     if start >= order.len() {
         println!("Nothing left after saved progress — reached the end of the library.");
+        offer_delete_disliked(provider, None, Arc::clone(&quit_flag), &mut disliked)?;
         return Ok(());
     }
 
@@ -67,6 +79,7 @@ pub fn run(provider: &dyn MusicProvider) -> Result<()> {
     while pos < total {
         if quit_flag.load(Ordering::SeqCst) {
             let _ = provider.pause();
+            offer_delete_disliked(provider, Some(&keys), Arc::clone(&quit_flag), &mut disliked)?;
             raw_println("\nQuit. Progress saved; run again to resume.")?;
             return Ok(());
         }
@@ -111,10 +124,24 @@ pub fn run(provider: &dyn MusicProvider) -> Result<()> {
             }
         }
 
-        let action = keys.wait_for_action(filter)?;
+        let action = loop {
+            match keys.wait_for_action(filter)? {
+                Action::SeekForward(0) => {}
+                Action::SeekForward(seconds) => {
+                    if let Err(err) = provider.seek_relative(seconds as f64) {
+                        raw_println(&format!("  (seek warning: {err})"))?;
+                    } else {
+                        raw_println(&format!("  → {}", format!("+{seconds}s").cyan()))?;
+                    }
+                    print!("> ");
+                    io::stdout().flush()?;
+                }
+                other => break other,
+            }
+        };
         match action {
             Action::Back => {
-                raw_println("  → back")?;
+                raw_println(&format!("  → {}", "back".blue()))?;
                 if pos == 0 {
                     continue;
                 }
@@ -123,30 +150,37 @@ pub fn run(provider: &dyn MusicProvider) -> Result<()> {
                 rewind_progress(&path, &order, pos)?;
                 continue;
             }
-            Action::Remove => {
-                raw_println("  → remove")?;
-                provider.remove_from_library(&track.id)?;
-                decisions::append(&decisions_path, &track, Decision::Remove)?;
+            Action::Dislike => {
+                raw_println(&format!("  → {}", "dislike".red()))?;
+                provider.set_disliked(&track.id, true)?;
+                disliked.add(&track)?;
+                decisions::append(&decisions_path, &track, Decision::Dislike)?;
             }
             Action::Favourite => {
-                raw_println("  → favourite")?;
+                raw_println(&format!("  → {}", "favourite".yellow()))?;
                 provider.set_favorited(&track.id, true)?;
+                disliked.remove_id(&track.id)?;
                 decisions::append(&decisions_path, &track, Decision::Favourite)?;
             }
             Action::Unfavourite => {
-                raw_println("  → unfavourite")?;
+                raw_println(&format!("  → {}", "unfavourite".magenta()))?;
                 provider.set_favorited(&track.id, false)?;
+                disliked.remove_id(&track.id)?;
                 decisions::append(&decisions_path, &track, Decision::Unfavourite)?;
             }
             Action::Skip => {
-                raw_println("  → keep")?;
+                raw_println(&format!("  → {}", "keep".green()))?;
+                provider.set_disliked(&track.id, false)?;
+                disliked.remove_id(&track.id)?;
                 decisions::append(&decisions_path, &track, Decision::Keep)?;
             }
             Action::Quit => {
                 let _ = provider.pause();
+                offer_delete_disliked(provider, Some(&keys), Arc::clone(&quit_flag), &mut disliked)?;
                 raw_println("\nQuit. Run again to resume on this track.")?;
                 return Ok(());
             }
+            Action::SeekForward(_) => unreachable!("seek is handled before deciding the track"),
         }
 
         progress::save(&path, &ProgressEntry::from_track(&track))?;
@@ -154,8 +188,49 @@ pub fn run(provider: &dyn MusicProvider) -> Result<()> {
     }
 
     let _ = provider.pause();
+    offer_delete_disliked(provider, Some(&keys), Arc::clone(&quit_flag), &mut disliked)?;
     raw_println("\nDone — reached the end of the library.")?;
     Ok(())
+}
+
+/// Load a cached index, or re-index the library and write the cache.
+/// Returns `None` if the user quits at the cache prompt.
+fn load_or_build_index(
+    provider: &dyn MusicProvider,
+    quit_flag: Arc<AtomicBool>,
+) -> Result<Option<Vec<ResumeCursor>>> {
+    let path = index_cache::index_path();
+    let cached = match index_cache::load(&path) {
+        Ok(tracks) => tracks,
+        Err(err) => {
+            eprintln!("Warning: could not read index cache; will re-index.\n  {err:#}");
+            None
+        }
+    };
+
+    if let Some(tracks) = cached {
+        match input::prompt_cache_or_reindex(quit_flag, tracks.len(), &path)? {
+            CacheChoice::UseCache => {
+                eprintln!(
+                    "Using cached index ({} tracks, oldest → newest).",
+                    tracks.len()
+                );
+                return Ok(Some(tracks));
+            }
+            CacheChoice::Quit => {
+                println!("Quit.");
+                return Ok(None);
+            }
+            CacheChoice::Reindex => {}
+        }
+    }
+
+    let order = provider.list_library_order_oldest_first()?;
+    if !order.is_empty() {
+        index_cache::save(&path, &order)?;
+        eprintln!("Wrote index cache to {}.", path.display());
+    }
+    Ok(Some(order))
 }
 
 /// Set progress so resume starts at `current_pos` (last completed = prior track, or cleared).
@@ -184,6 +259,65 @@ fn rewind_progress(
     )
 }
 
+fn offer_delete_disliked(
+    provider: &dyn MusicProvider,
+    keys: Option<&KeyReader>,
+    quit_flag: Arc<AtomicBool>,
+    pending: &mut DislikedSet,
+) -> Result<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    match keys {
+        Some(keys) => confirm_and_maybe_delete(provider, keys, pending),
+        None => {
+            let keys = KeyReader::new(quit_flag)?;
+            confirm_and_maybe_delete(provider, &keys, pending)
+        }
+    }
+}
+
+fn confirm_and_maybe_delete(
+    provider: &dyn MusicProvider,
+    keys: &KeyReader,
+    pending: &mut DislikedSet,
+) -> Result<()> {
+    let n = pending.len();
+    let noun = if n == 1 { "track" } else { "tracks" };
+    raw_println(&format!(
+        "\nDelete {n} disliked {noun} from the library? [y/n]"
+    ))?;
+    for track in pending.tracks().iter().take(10) {
+        raw_println(&format!("  {} — {}", track.name, track.artist))?;
+    }
+    if n > 10 {
+        raw_println(&format!("  … and {} more", n - 10))?;
+    }
+    print!("> ");
+    io::stdout().flush()?;
+
+    if !keys.wait_for_yes_no()? {
+        raw_println("  Left disliked tracks in the library.")?;
+        return Ok(());
+    }
+
+    raw_println("  Removing from library…")?;
+    let ids = pending.ids();
+    let gone = provider.remove_from_library(&ids)?;
+    pending.remove_ids(&gone)?;
+    let leftover = pending.len();
+    if leftover == 0 {
+        raw_println(&format!("  Deleted {} {noun}.", gone.len()))?;
+    } else {
+        raw_println(&format!(
+            "  Deleted {}; {leftover} could not be removed.",
+            gone.len()
+        ))?;
+    }
+    Ok(())
+}
+
 fn raw_println(msg: &str) -> Result<()> {
     print!("{msg}\r\n");
     io::stdout().flush()?;
@@ -191,10 +325,15 @@ fn raw_println(msg: &str) -> Result<()> {
 }
 
 fn print_track(index: usize, total: usize, track: &TrackInfo, key_help: &str) -> Result<()> {
-    let fav = if track.favorited { " ★" } else { "" };
+    let fav = if track.favorited {
+        format!(" {}", "★".yellow())
+    } else {
+        String::new()
+    };
+    let title = track.name.as_str().bold().blue();
     let line = format!(
-        "\r\n[{index}/{total}] {} — {} ({}){fav}\r\n  {key_help}\r\n> ",
-        track.name, track.artist, track.album
+        "\r\n[{index}/{total}] {title} — {} ({}){fav}\r\n  {key_help}\r\n> ",
+        track.artist, track.album
     );
     print!("{line}");
     io::stdout().flush()?;
