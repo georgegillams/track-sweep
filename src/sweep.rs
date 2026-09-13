@@ -170,7 +170,9 @@ pub fn run(provider: &dyn MusicProvider) -> Result<()> {
             }
             Action::Skip => {
                 raw_println(&format!("  → {}", "keep".green()))?;
-                provider.set_disliked(&track.id, false)?;
+                if !track.favorited {
+                    provider.set_disliked(&track.id, false)?;
+                }
                 disliked.remove_id(&track.id)?;
                 decisions::append(&decisions_path, &track, Decision::Keep)?;
             }
