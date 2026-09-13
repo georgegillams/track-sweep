@@ -1,7 +1,7 @@
 use std::io::{self, Write};
 use std::process::Command;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 use super::{MusicProvider, ResumeCursor, TrackInfo};
@@ -30,6 +30,11 @@ struct JxaCursor {
 #[derive(Debug, Deserialize)]
 struct CountResult {
     count: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoneResult {
+    gone: Vec<String>,
 }
 
 /// Apple Music / Music.app backend via `osascript` + JXA.
@@ -169,6 +174,68 @@ impl AppleMusicProvider {
             favorited: t.favorited,
         }
     }
+
+    fn remove_from_library_chunk(&self, ids: &[String]) -> Result<Vec<String>> {
+        let ids_js = ids
+            .iter()
+            .map(|id| Self::js_string(id))
+            .collect::<Vec<_>>()
+            .join(",");
+        let script = format!(
+            r#"
+            const app = Application('Music');
+            app.run();
+            const ids = [{ids_js}];
+            const gone = [];
+            for (const id of ids) {{
+                try {{
+                    const tracks = app.libraryPlaylists[0].tracks.whose({{ persistentID: id }});
+                    if (tracks.length === 0) {{
+                        gone.push(id);
+                        continue;
+                    }}
+                    tracks[0].delete();
+                    gone.push(id);
+                }} catch (e) {{}}
+            }}
+            JSON.stringify({{ gone }});
+            "#
+        );
+        let raw = Self::run_jxa(&script)
+            .context("failed to remove disliked tracks from library")?;
+        let parsed: GoneResult = serde_json::from_str(&raw)
+            .with_context(|| format!("failed to parse remove result: {raw}"))?;
+        Ok(parsed.gone)
+    }
+
+    fn set_player_position(&self, seconds: f64, relative: bool) -> Result<()> {
+        let pos_expr = if relative {
+            format!("Number(app.playerPosition()) + {seconds}")
+        } else {
+            seconds.to_string()
+        };
+        let script = format!(
+            r#"
+            const app = Application('Music');
+            app.run();
+            let pos = {pos_expr};
+            if (pos < 0) {{
+                pos = 0;
+            }}
+            try {{
+                const t = app.currentTrack();
+                const dur = Number(t.duration());
+                if (dur > 0 && pos >= dur) {{
+                    pos = Math.max(0, dur - 1);
+                }}
+            }} catch (e) {{}}
+            app.playerPosition = pos;
+            JSON.stringify({{ ok: true, position: pos }});
+            "#
+        );
+        Self::run_jxa(&script)?;
+        Ok(())
+    }
 }
 
 impl Default for AppleMusicProvider {
@@ -251,24 +318,11 @@ impl MusicProvider for AppleMusicProvider {
     }
 
     fn seek(&self, seconds: f64) -> Result<()> {
-        let script = format!(
-            r#"
-            const app = Application('Music');
-            app.run();
-            let pos = {seconds};
-            try {{
-                const t = app.currentTrack();
-                const dur = Number(t.duration());
-                if (dur > 0 && pos >= dur) {{
-                    pos = Math.max(0, dur - 1);
-                }}
-            }} catch (e) {{}}
-            app.playerPosition = pos;
-            JSON.stringify({{ ok: true, position: pos }});
-            "#
-        );
-        Self::run_jxa(&script)?;
-        Ok(())
+        self.set_player_position(seconds, false)
+    }
+
+    fn seek_relative(&self, seconds: f64) -> Result<()> {
+        self.set_player_position(seconds, true)
     }
 
     fn set_favorited(&self, id: &str, favorited: bool) -> Result<()> {
@@ -280,10 +334,25 @@ impl MusicProvider for AppleMusicProvider {
         Ok(())
     }
 
-    fn remove_from_library(&self, id: &str) -> Result<()> {
-        let script = Self::find_track_script(id, "track.delete();");
-        Self::run_jxa(&script).with_context(|| anyhow!("failed to remove track {id}"))?;
+    fn set_disliked(&self, id: &str, disliked: bool) -> Result<()> {
+        let script = Self::find_track_script(
+            id,
+            &format!("track.disliked = {};", if disliked { "true" } else { "false" }),
+        );
+        Self::run_jxa(&script)?;
         Ok(())
+    }
+
+    fn remove_from_library(&self, ids: &[String]) -> Result<Vec<String>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut gone = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(100) {
+            gone.extend(self.remove_from_library_chunk(chunk)?);
+        }
+        Ok(gone)
     }
 
     fn pause(&self) -> Result<()> {

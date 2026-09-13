@@ -1,6 +1,7 @@
 pub mod apple_music;
 
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 
 /// Platform-agnostic track metadata used by the sweep loop.
@@ -18,9 +19,10 @@ pub struct TrackInfo {
 }
 
 /// Cursor for ordering / resuming (id + date added).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResumeCursor {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub date_added: Option<String>,
 }
 
@@ -49,9 +51,13 @@ pub trait MusicProvider {
 
     fn play_track(&self, id: &str) -> Result<()>;
     fn seek(&self, seconds: f64) -> Result<()>;
+    /// Move playback forward (or backward if negative) from the current position.
+    fn seek_relative(&self, seconds: f64) -> Result<()>;
     fn set_favorited(&self, id: &str, favorited: bool) -> Result<()>;
+    fn set_disliked(&self, id: &str, disliked: bool) -> Result<()>;
     /// Remove from the music library only (do not delete local files via Finder).
-    fn remove_from_library(&self, id: &str) -> Result<()>;
+    /// Returns ids that are gone (deleted or already missing).
+    fn remove_from_library(&self, ids: &[String]) -> Result<Vec<String>>;
     fn pause(&self) -> Result<()>;
 }
 
