@@ -6,16 +6,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::provider::TrackInfo;
 
-const DISLIKED_FILE: &str = "disliked.json";
+const REMOVED_FILE: &str = "removed.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DislikedTrack {
+pub struct RemovedTrack {
     pub id: String,
     pub name: String,
     pub artist: String,
 }
 
-impl DislikedTrack {
+impl RemovedTrack {
     fn from_track(track: &TrackInfo) -> Self {
         Self {
             id: track.id.clone(),
@@ -26,22 +26,22 @@ impl DislikedTrack {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct DislikedFile {
-    tracks: Vec<DislikedTrack>,
+struct RemovedFile {
+    tracks: Vec<RemovedTrack>,
 }
 
-pub fn disliked_path() -> PathBuf {
-    PathBuf::from(DISLIKED_FILE)
+pub fn removed_path() -> PathBuf {
+    PathBuf::from(REMOVED_FILE)
 }
 
-pub struct DislikedSet {
+pub struct RemovedSet {
     path: PathBuf,
-    tracks: Vec<DislikedTrack>,
+    tracks: Vec<RemovedTrack>,
 }
 
-impl DislikedSet {
+impl RemovedSet {
     pub fn load() -> Result<Self> {
-        let path = disliked_path();
+        let path = removed_path();
         let tracks = load(&path)?.unwrap_or_default();
         Ok(Self { path, tracks })
     }
@@ -54,7 +54,7 @@ impl DislikedSet {
         self.tracks.len()
     }
 
-    pub fn tracks(&self) -> &[DislikedTrack] {
+    pub fn tracks(&self) -> &[RemovedTrack] {
         &self.tracks
     }
 
@@ -62,9 +62,13 @@ impl DislikedSet {
         self.tracks.iter().map(|t| t.id.clone()).collect()
     }
 
+    pub fn contains(&self, id: &str) -> bool {
+        self.tracks.iter().any(|t| t.id == id)
+    }
+
     pub fn add(&mut self, track: &TrackInfo) -> Result<()> {
         self.tracks.retain(|t| t.id != track.id);
-        self.tracks.push(DislikedTrack::from_track(track));
+        self.tracks.push(RemovedTrack::from_track(track));
         self.save()
     }
 
@@ -94,31 +98,30 @@ impl DislikedSet {
     }
 }
 
-fn load(path: &Path) -> Result<Option<Vec<DislikedTrack>>> {
+fn load(path: &Path) -> Result<Option<Vec<RemovedTrack>>> {
     if !path.exists() {
         return Ok(None);
     }
 
-    let contents = fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
-    let parsed: DislikedFile = serde_json::from_str(&contents)
+    let contents =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let parsed: RemovedFile = serde_json::from_str(&contents)
         .with_context(|| format!("failed to parse {} (expected JSON)", path.display()))?;
     Ok(Some(parsed.tracks))
 }
 
-fn save(path: &Path, tracks: &[DislikedTrack]) -> Result<()> {
+fn save(path: &Path, tracks: &[RemovedTrack]) -> Result<()> {
     if tracks.is_empty() {
         if path.exists() {
-            fs::remove_file(path)
-                .with_context(|| format!("failed to clear {}", path.display()))?;
+            fs::remove_file(path).with_context(|| format!("failed to clear {}", path.display()))?;
         }
         return Ok(());
     }
 
-    let json = serde_json::to_string_pretty(&DislikedFile {
+    let json = serde_json::to_string_pretty(&RemovedFile {
         tracks: tracks.to_vec(),
     })
-    .context("failed to serialize disliked tracks")?;
+    .context("failed to serialize removed tracks")?;
     fs::write(path, format!("{json}\n"))
         .with_context(|| format!("failed to write {}", path.display()))
 }
@@ -133,7 +136,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("track-sweep-disliked-{label}-{nanos}.json"))
+        std::env::temp_dir().join(format!("track-sweep-removed-{label}-{nanos}.json"))
     }
 
     fn track(id: &str, name: &str) -> TrackInfo {
@@ -151,7 +154,7 @@ mod tests {
     #[test]
     fn add_dedupes_and_round_trips() {
         let path = temp_path("round");
-        let mut set = DislikedSet {
+        let mut set = RemovedSet {
             path: path.clone(),
             tracks: Vec::new(),
         };
@@ -165,7 +168,10 @@ mod tests {
         let loaded = load(&path).unwrap().unwrap();
         assert_eq!(loaded, set.tracks);
 
+        assert!(set.contains("a"));
+        assert!(set.contains("b"));
         set.remove_id("b").unwrap();
+        assert!(!set.contains("b"));
         assert_eq!(set.ids(), vec!["a".to_string()]);
         set.remove_ids(&["a".into()]).unwrap();
         assert!(set.is_empty());

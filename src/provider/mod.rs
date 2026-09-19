@@ -40,6 +40,12 @@ impl ResumeCursor {
     }
 }
 
+/// Music.app playlist used to stage tracks marked for removal.
+pub const REMOVAL_PLAYLIST_NAME: &str = "To Remove — Track Sweep";
+
+/// Music.app playlist of tracks whose name matches an earlier library track.
+pub const DUPLICATE_PLAYLIST_NAME: &str = "Possible Duplicate — Track Sweep";
+
 /// Abstraction over a music library / player so other platforms can be added later.
 pub trait MusicProvider {
     /// Lightweight index of all library tracks, oldest date-added first.
@@ -54,7 +60,9 @@ pub trait MusicProvider {
     /// Move playback forward (or backward if negative) from the current position.
     fn seek_relative(&self, seconds: f64) -> Result<()>;
     fn set_favorited(&self, id: &str, favorited: bool) -> Result<()>;
-    fn set_disliked(&self, id: &str, disliked: bool) -> Result<()>;
+    /// Stage (`true`) or unstage (`false`) a track for later library deletion.
+    /// Apple Music uses [`REMOVAL_PLAYLIST_NAME`].
+    fn set_removed(&self, id: &str, removed: bool) -> Result<()>;
     /// Remove from the music library only (do not delete local files via Finder).
     /// Returns ids that are gone (deleted or already missing).
     fn remove_from_library(&self, ids: &[String]) -> Result<Vec<String>>;
@@ -72,9 +80,7 @@ pub fn resume_start_index(order: &[ResumeCursor], after: Option<&ResumeCursor>) 
     }
 
     if after.date_added.is_some() {
-        eprintln!(
-            "Warning: progress track id not in library; resuming after saved date added."
-        );
+        eprintln!("Warning: progress track id not in library; resuming after saved date added.");
         return order
             .iter()
             .position(|t| ResumeCursor::cmp_order(t, after) == Ordering::Greater)
@@ -107,7 +113,11 @@ mod tests {
 
     #[test]
     fn resume_after_id() {
-        let order = vec![cur("a", Some("2020")), cur("b", Some("2021")), cur("c", Some("2022"))];
+        let order = vec![
+            cur("a", Some("2020")),
+            cur("b", Some("2021")),
+            cur("c", Some("2022")),
+        ];
         assert_eq!(resume_start_index(&order, Some(&cur("a", Some("2020")))), 1);
         assert_eq!(resume_start_index(&order, Some(&cur("b", Some("2021")))), 2);
     }
