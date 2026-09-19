@@ -6,12 +6,13 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use crossterm::style::Stylize;
 
+use crate::celebrate;
 use crate::decisions::{self, Decision};
-use crate::disliked::DislikedSet;
 use crate::index_cache;
 use crate::input::{self, Action, ActionFilter, CacheChoice, KeyReader};
 use crate::progress::{self, progress_path, ProgressEntry};
-use crate::provider::{self, MusicProvider, ResumeCursor, TrackInfo};
+use crate::provider::{self, MusicProvider, ResumeCursor, TrackInfo, REMOVAL_PLAYLIST_NAME};
+use crate::removed::RemovedSet;
 
 const SEEK_SECONDS: f64 = 30.0;
 const SEEK_MIN_DURATION_SECS: f64 = 60.0;
@@ -26,13 +27,13 @@ pub fn run(provider: &dyn MusicProvider) -> Result<()> {
         .context("failed to install Ctrl-C handler")?;
     }
 
-    let mut disliked = DislikedSet::load()?;
+    let mut removed = RemovedSet::load()?;
 
     // Index (or load cache) before enabling raw mode so progress lines stay readable.
     let order = match load_or_build_index(provider, Arc::clone(&quit_flag))? {
         Some(order) => order,
         None => {
-            offer_delete_disliked(provider, None, Arc::clone(&quit_flag), &mut disliked)?;
+            offer_delete_removed(provider, None, Arc::clone(&quit_flag), &mut removed)?;
             return Ok(());
         }
     };
@@ -61,7 +62,7 @@ pub fn run(provider: &dyn MusicProvider) -> Result<()> {
     let start = provider::resume_start_index(&order, cursor.as_ref());
     if start >= order.len() {
         println!("Nothing left after saved progress — reached the end of the library.");
-        offer_delete_disliked(provider, None, Arc::clone(&quit_flag), &mut disliked)?;
+        offer_delete_removed(provider, None, Arc::clone(&quit_flag), &mut removed)?;
         return Ok(());
     }
 
@@ -75,11 +76,12 @@ pub fn run(provider: &dyn MusicProvider) -> Result<()> {
 
     let keys = KeyReader::new(Arc::clone(&quit_flag))?;
     let mut pos = start;
+    let mut session_sorted: u32 = 0;
 
     while pos < total {
         if quit_flag.load(Ordering::SeqCst) {
             let _ = provider.pause();
-            offer_delete_disliked(provider, Some(&keys), Arc::clone(&quit_flag), &mut disliked)?;
+            offer_delete_removed(provider, Some(&keys), Arc::clone(&quit_flag), &mut removed)?;
             raw_println("\nQuit. Progress saved; run again to resume.")?;
             return Ok(());
         }
@@ -150,35 +152,32 @@ pub fn run(provider: &dyn MusicProvider) -> Result<()> {
                 rewind_progress(&path, &order, pos)?;
                 continue;
             }
-            Action::Dislike => {
-                raw_println(&format!("  → {}", "dislike".red()))?;
-                provider.set_disliked(&track.id, true)?;
-                disliked.add(&track)?;
-                decisions::append(&decisions_path, &track, Decision::Dislike)?;
+            Action::Remove => {
+                raw_println(&format!("  → {}", "remove".red()))?;
+                provider.set_removed(&track.id, true)?;
+                removed.add(&track)?;
+                decisions::append(&decisions_path, &track, Decision::Remove)?;
             }
             Action::Favourite => {
                 raw_println(&format!("  → {}", "favourite".yellow()))?;
                 provider.set_favorited(&track.id, true)?;
-                disliked.remove_id(&track.id)?;
+                unstage_removed(provider, &mut removed, &track.id)?;
                 decisions::append(&decisions_path, &track, Decision::Favourite)?;
             }
             Action::Unfavourite => {
                 raw_println(&format!("  → {}", "unfavourite".magenta()))?;
                 provider.set_favorited(&track.id, false)?;
-                disliked.remove_id(&track.id)?;
+                unstage_removed(provider, &mut removed, &track.id)?;
                 decisions::append(&decisions_path, &track, Decision::Unfavourite)?;
             }
             Action::Skip => {
                 raw_println(&format!("  → {}", "keep".green()))?;
-                if !track.favorited {
-                    provider.set_disliked(&track.id, false)?;
-                }
-                disliked.remove_id(&track.id)?;
+                unstage_removed(provider, &mut removed, &track.id)?;
                 decisions::append(&decisions_path, &track, Decision::Keep)?;
             }
             Action::Quit => {
                 let _ = provider.pause();
-                offer_delete_disliked(provider, Some(&keys), Arc::clone(&quit_flag), &mut disliked)?;
+                offer_delete_removed(provider, Some(&keys), Arc::clone(&quit_flag), &mut removed)?;
                 raw_println("\nQuit. Run again to resume on this track.")?;
                 return Ok(());
             }
@@ -187,10 +186,12 @@ pub fn run(provider: &dyn MusicProvider) -> Result<()> {
 
         progress::save(&path, &ProgressEntry::from_track(&track))?;
         pos += 1;
+        session_sorted += 1;
+        celebrate::maybe_celebrate(session_sorted)?;
     }
 
     let _ = provider.pause();
-    offer_delete_disliked(provider, Some(&keys), Arc::clone(&quit_flag), &mut disliked)?;
+    offer_delete_removed(provider, Some(&keys), Arc::clone(&quit_flag), &mut removed)?;
     raw_println("\nDone — reached the end of the library.")?;
     Ok(())
 }
@@ -243,8 +244,7 @@ fn rewind_progress(
 ) -> Result<()> {
     if current_pos == 0 {
         if path.exists() {
-            fs::remove_file(path)
-                .with_context(|| format!("failed to clear {}", path.display()))?;
+            fs::remove_file(path).with_context(|| format!("failed to clear {}", path.display()))?;
         }
         return Ok(());
     }
@@ -261,11 +261,18 @@ fn rewind_progress(
     )
 }
 
-fn offer_delete_disliked(
+fn unstage_removed(provider: &dyn MusicProvider, pending: &mut RemovedSet, id: &str) -> Result<()> {
+    if pending.contains(id) {
+        provider.set_removed(id, false)?;
+    }
+    pending.remove_id(id)
+}
+
+fn offer_delete_removed(
     provider: &dyn MusicProvider,
     keys: Option<&KeyReader>,
     quit_flag: Arc<AtomicBool>,
-    pending: &mut DislikedSet,
+    pending: &mut RemovedSet,
 ) -> Result<()> {
     if pending.is_empty() {
         return Ok(());
@@ -283,13 +290,14 @@ fn offer_delete_disliked(
 fn confirm_and_maybe_delete(
     provider: &dyn MusicProvider,
     keys: &KeyReader,
-    pending: &mut DislikedSet,
+    pending: &mut RemovedSet,
 ) -> Result<()> {
     let n = pending.len();
     let noun = if n == 1 { "track" } else { "tracks" };
     raw_println(&format!(
-        "\nDelete {n} disliked {noun} from the library? [y/n]"
+        "\nDelete {n} removed {noun} from the library? [y/n]"
     ))?;
+    raw_println(&format!("Staged on playlist “{REMOVAL_PLAYLIST_NAME}”."))?;
     for track in pending.tracks().iter().take(10) {
         raw_println(&format!("  {} — {}", track.name, track.artist))?;
     }
@@ -300,7 +308,9 @@ fn confirm_and_maybe_delete(
     io::stdout().flush()?;
 
     if !keys.wait_for_yes_no()? {
-        raw_println("  Left disliked tracks in the library.")?;
+        raw_println(&format!(
+            "  Left tracks in the library (still on “{REMOVAL_PLAYLIST_NAME}”)."
+        ))?;
         return Ok(());
     }
 

@@ -1,9 +1,11 @@
+mod celebrate;
 mod decisions;
-mod disliked;
+mod duplicates;
 mod index_cache;
 mod input;
 mod progress;
 mod provider;
+mod removed;
 mod sweep;
 
 use anyhow::Result;

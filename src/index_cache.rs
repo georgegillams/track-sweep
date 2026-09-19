@@ -22,8 +22,8 @@ pub fn load(path: &Path) -> Result<Option<Vec<ResumeCursor>>> {
         return Ok(None);
     }
 
-    let contents = fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
+    let contents =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
     let parsed: IndexFile = serde_json::from_str(&contents)
         .with_context(|| format!("failed to parse {} (expected JSON)", path.display()))?;
     Ok(Some(parsed.tracks))

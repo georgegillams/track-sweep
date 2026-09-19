@@ -4,7 +4,9 @@ use std::process::Command;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
-use super::{MusicProvider, ResumeCursor, TrackInfo};
+use crate::duplicates;
+
+use super::{MusicProvider, ResumeCursor, TrackInfo, DUPLICATE_PLAYLIST_NAME};
 
 const INDEX_BATCH_SIZE: usize = 250;
 
@@ -25,6 +27,14 @@ struct JxaCursor {
     id: String,
     #[serde(rename = "dateAdded")]
     date_added: Option<String>,
+    #[serde(default)]
+    name: String,
+}
+
+struct IndexRow {
+    id: String,
+    date_added: Option<String>,
+    name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -64,11 +74,7 @@ impl AppleMusicProvider {
                      Details: {stderr}"
                 );
             }
-            bail!(
-                "osascript failed ({}): {}",
-                output.status,
-                stderr.trim()
-            );
+            bail!("osascript failed ({}): {}", output.status, stderr.trim());
         }
 
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
@@ -126,7 +132,7 @@ impl AppleMusicProvider {
         Ok(parsed.count)
     }
 
-    fn fetch_cursor_batch(&self, offset: usize, limit: usize) -> Result<Vec<ResumeCursor>> {
+    fn fetch_cursor_batch(&self, offset: usize, limit: usize) -> Result<Vec<IndexRow>> {
         let script = format!(
             r#"
             const app = Application('Music');
@@ -145,7 +151,8 @@ impl AppleMusicProvider {
                 }} catch (e) {{}}
                 out.push({{
                     id: String(t.persistentID()),
-                    dateAdded: dateAdded
+                    dateAdded: dateAdded,
+                    name: String(t.name())
                 }});
             }}
             JSON.stringify(out);
@@ -156,9 +163,10 @@ impl AppleMusicProvider {
             .with_context(|| format!("failed to parse index batch at offset {offset}"))?;
         Ok(parsed
             .into_iter()
-            .map(|c| ResumeCursor {
+            .map(|c| IndexRow {
                 id: c.id,
                 date_added: c.date_added,
+                name: c.name,
             })
             .collect())
     }
@@ -175,17 +183,105 @@ impl AppleMusicProvider {
         }
     }
 
+    fn add_to_removal_playlist(&self, id: &str) -> Result<()> {
+        let id_js = Self::js_string(id);
+        let name_js = Self::js_string(super::REMOVAL_PLAYLIST_NAME);
+        let script = format!(
+            r#"
+            const app = Application('Music');
+            app.run();
+            const id = {id_js};
+            const playlistName = {name_js};
+            const lists = app.playlists.whose({{ name: playlistName }});
+            let playlist;
+            if (lists.length === 0) {{
+                playlist = app.make({{ new: 'playlist', withProperties: {{ name: playlistName }} }});
+            }} else {{
+                playlist = lists[0];
+            }}
+            const libTracks = app.libraryPlaylists[0].tracks.whose({{ persistentID: id }});
+            if (libTracks.length === 0) {{
+                throw new Error('track not found: ' + id);
+            }}
+            const existing = playlist.tracks.whose({{ persistentID: id }});
+            if (existing.length === 0) {{
+                app.duplicate(libTracks[0], {{ to: playlist }});
+            }}
+            JSON.stringify({{ ok: true }});
+            "#
+        );
+        Self::run_jxa(&script).with_context(|| {
+            format!(
+                "failed to add track to playlist {}",
+                super::REMOVAL_PLAYLIST_NAME
+            )
+        })?;
+        Ok(())
+    }
+
+    fn remove_from_removal_playlist(&self, id: &str) -> Result<()> {
+        let id_js = Self::js_string(id);
+        let name_js = Self::js_string(super::REMOVAL_PLAYLIST_NAME);
+        let script = format!(
+            r#"
+            const app = Application('Music');
+            app.run();
+            const id = {id_js};
+            const playlistName = {name_js};
+            const lists = app.playlists.whose({{ name: playlistName }});
+            if (lists.length > 0) {{
+                const playlist = lists[0];
+                const existing = playlist.tracks.whose({{ persistentID: id }});
+                for (let i = existing.length - 1; i >= 0; i--) {{
+                    existing[i].delete();
+                }}
+                if (playlist.tracks.length === 0) {{
+                    playlist.delete();
+                }}
+            }}
+            JSON.stringify({{ ok: true }});
+            "#
+        );
+        Self::run_jxa(&script).with_context(|| {
+            format!(
+                "failed to remove track from playlist {}",
+                super::REMOVAL_PLAYLIST_NAME
+            )
+        })?;
+        Ok(())
+    }
+
+    fn delete_empty_removal_playlist(&self) -> Result<()> {
+        let name_js = Self::js_string(super::REMOVAL_PLAYLIST_NAME);
+        let script = format!(
+            r#"
+            const app = Application('Music');
+            app.run();
+            const playlistName = {name_js};
+            const lists = app.playlists.whose({{ name: playlistName }});
+            if (lists.length > 0 && lists[0].tracks.length === 0) {{
+                lists[0].delete();
+            }}
+            JSON.stringify({{ ok: true }});
+            "#
+        );
+        Self::run_jxa(&script)?;
+        Ok(())
+    }
+
     fn remove_from_library_chunk(&self, ids: &[String]) -> Result<Vec<String>> {
         let ids_js = ids
             .iter()
             .map(|id| Self::js_string(id))
             .collect::<Vec<_>>()
             .join(",");
+        let name_js = Self::js_string(super::REMOVAL_PLAYLIST_NAME);
         let script = format!(
             r#"
             const app = Application('Music');
             app.run();
             const ids = [{ids_js}];
+            const playlistName = {name_js};
             const gone = [];
             for (const id of ids) {{
                 try {{
@@ -198,14 +294,93 @@ impl AppleMusicProvider {
                     gone.push(id);
                 }} catch (e) {{}}
             }}
+            const lists = app.playlists.whose({{ name: playlistName }});
+            if (lists.length > 0) {{
+                const playlist = lists[0];
+                for (const id of gone) {{
+                    const existing = playlist.tracks.whose({{ persistentID: id }});
+                    for (let i = existing.length - 1; i >= 0; i--) {{
+                        try {{ existing[i].delete(); }} catch (e) {{}}
+                    }}
+                }}
+            }}
             JSON.stringify({{ gone }});
             "#
         );
-        let raw = Self::run_jxa(&script)
-            .context("failed to remove disliked tracks from library")?;
+        let raw = Self::run_jxa(&script).context("failed to remove staged tracks from library")?;
         let parsed: GoneResult = serde_json::from_str(&raw)
             .with_context(|| format!("failed to parse remove result: {raw}"))?;
         Ok(parsed.gone)
+    }
+
+    fn replace_duplicate_playlist(&self, ids: &[String]) -> Result<()> {
+        self.delete_named_playlist(DUPLICATE_PLAYLIST_NAME)?;
+        if ids.is_empty() {
+            return Ok(());
+        }
+
+        eprintln!("Updating “{DUPLICATE_PLAYLIST_NAME}”…");
+        let _ = io::stderr().flush();
+        for chunk in ids.chunks(100) {
+            self.add_to_named_playlist(DUPLICATE_PLAYLIST_NAME, chunk)?;
+        }
+        Ok(())
+    }
+
+    fn delete_named_playlist(&self, name: &str) -> Result<()> {
+        let name_js = Self::js_string(name);
+        let script = format!(
+            r#"
+            const app = Application('Music');
+            app.run();
+            const playlistName = {name_js};
+            const lists = app.playlists.whose({{ name: playlistName }});
+            for (let i = lists.length - 1; i >= 0; i--) {{
+                lists[i].delete();
+            }}
+            JSON.stringify({{ ok: true }});
+            "#
+        );
+        Self::run_jxa(&script).with_context(|| format!("failed to replace playlist {name}"))?;
+        Ok(())
+    }
+
+    fn add_to_named_playlist(&self, name: &str, ids: &[String]) -> Result<()> {
+        let ids_js = ids
+            .iter()
+            .map(|id| Self::js_string(id))
+            .collect::<Vec<_>>()
+            .join(",");
+        let name_js = Self::js_string(name);
+        let script = format!(
+            r#"
+            const app = Application('Music');
+            app.run();
+            const ids = [{ids_js}];
+            const playlistName = {name_js};
+            const lists = app.playlists.whose({{ name: playlistName }});
+            let playlist;
+            if (lists.length === 0) {{
+                playlist = app.make({{ new: 'playlist', withProperties: {{ name: playlistName }} }});
+            }} else {{
+                playlist = lists[0];
+            }}
+            for (const id of ids) {{
+                const libTracks = app.libraryPlaylists[0].tracks.whose({{ persistentID: id }});
+                if (libTracks.length === 0) {{
+                    continue;
+                }}
+                const existing = playlist.tracks.whose({{ persistentID: id }});
+                if (existing.length === 0) {{
+                    app.duplicate(libTracks[0], {{ to: playlist }});
+                }}
+            }}
+            JSON.stringify({{ ok: true }});
+            "#
+        );
+        Self::run_jxa(&script)
+            .with_context(|| format!("failed to add tracks to playlist {name}"))?;
+        Ok(())
     }
 
     fn set_player_position(&self, seconds: f64, relative: bool) -> Result<()> {
@@ -249,6 +424,7 @@ impl MusicProvider for AppleMusicProvider {
         self.ensure_running()?;
         let total = self.track_count()?;
         if total == 0 {
+            self.replace_duplicate_playlist(&[])?;
             return Ok(Vec::new());
         }
 
@@ -270,9 +446,33 @@ impl MusicProvider for AppleMusicProvider {
         }
         eprintln!();
 
-        all.sort_by(ResumeCursor::cmp_order);
-        eprintln!("Index ready ({} tracks, oldest → newest).", all.len());
-        Ok(all)
+        let duplicate_ids =
+            duplicates::duplicate_ids(all.iter().map(|row| (row.id.as_str(), row.name.as_str())));
+        self.replace_duplicate_playlist(&duplicate_ids)?;
+        if duplicate_ids.is_empty() {
+            eprintln!("No possible duplicate titles found.");
+        } else {
+            let noun = if duplicate_ids.len() == 1 {
+                "track"
+            } else {
+                "tracks"
+            };
+            eprintln!(
+                "Added {} possible duplicate {noun} to “{DUPLICATE_PLAYLIST_NAME}”.",
+                duplicate_ids.len()
+            );
+        }
+
+        let mut order: Vec<ResumeCursor> = all
+            .into_iter()
+            .map(|row| ResumeCursor {
+                id: row.id,
+                date_added: row.date_added,
+            })
+            .collect();
+        order.sort_by(ResumeCursor::cmp_order);
+        eprintln!("Index ready ({} tracks, oldest → newest).", order.len());
+        Ok(order)
     }
 
     fn get_track(&self, id: &str) -> Result<TrackInfo> {
@@ -306,8 +506,8 @@ impl MusicProvider for AppleMusicProvider {
             "#
         );
         let raw = Self::run_jxa(&script)?;
-        let parsed: JxaTrack = serde_json::from_str(&raw)
-            .with_context(|| format!("failed to parse track {id}"))?;
+        let parsed: JxaTrack =
+            serde_json::from_str(&raw).with_context(|| format!("failed to parse track {id}"))?;
         Ok(Self::jxa_to_track(parsed))
     }
 
@@ -328,19 +528,21 @@ impl MusicProvider for AppleMusicProvider {
     fn set_favorited(&self, id: &str, favorited: bool) -> Result<()> {
         let script = Self::find_track_script(
             id,
-            &format!("track.favorited = {};", if favorited { "true" } else { "false" }),
+            &format!(
+                "track.favorited = {};",
+                if favorited { "true" } else { "false" }
+            ),
         );
         Self::run_jxa(&script)?;
         Ok(())
     }
 
-    fn set_disliked(&self, id: &str, disliked: bool) -> Result<()> {
-        let script = Self::find_track_script(
-            id,
-            &format!("track.disliked = {};", if disliked { "true" } else { "false" }),
-        );
-        Self::run_jxa(&script)?;
-        Ok(())
+    fn set_removed(&self, id: &str, removed: bool) -> Result<()> {
+        if removed {
+            self.add_to_removal_playlist(id)
+        } else {
+            self.remove_from_removal_playlist(id)
+        }
     }
 
     fn remove_from_library(&self, ids: &[String]) -> Result<Vec<String>> {
@@ -352,6 +554,7 @@ impl MusicProvider for AppleMusicProvider {
         for chunk in ids.chunks(100) {
             gone.extend(self.remove_from_library_chunk(chunk)?);
         }
+        let _ = self.delete_empty_removal_playlist();
         Ok(gone)
     }
 

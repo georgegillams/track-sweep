@@ -43,7 +43,7 @@ pub fn prompt_cache_or_reindex(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
-    Dislike,
+    Remove,
     Favourite,
     Unfavourite,
     Skip,
@@ -70,7 +70,7 @@ impl ActionFilter {
     }
 
     pub fn key_help(self) -> String {
-        let mut parts = vec![format!("[r] {}", "dislike".red())];
+        let mut parts = vec![format!("[r] {}", "remove".red())];
         if self.allow_favourite {
             parts.push(format!("[f] {}", "favourite".yellow()));
         }
@@ -160,7 +160,7 @@ impl KeyReader {
 
                         match code {
                             KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(Action::Quit),
-                            KeyCode::Char('r') | KeyCode::Char('R') => return Ok(Action::Dislike),
+                            KeyCode::Char('r') | KeyCode::Char('R') => return Ok(Action::Remove),
                             KeyCode::Char('f') | KeyCode::Char('F') if filter.allow_favourite => {
                                 return Ok(Action::Favourite);
                             }
@@ -170,7 +170,10 @@ impl KeyReader {
                             KeyCode::Char('b') | KeyCode::Char('B') if filter.allow_back => {
                                 return Ok(Action::Back);
                             }
-                            KeyCode::Char(' ') | KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => return Ok(Action::Skip),
+                            KeyCode::Char(' ')
+                            | KeyCode::Enter
+                            | KeyCode::Char('y')
+                            | KeyCode::Char('Y') => return Ok(Action::Skip),
                             KeyCode::Char(c) if c.is_ascii_digit() => {
                                 let n = c.to_digit(10).expect("ascii digit");
                                 return Ok(Action::SeekForward(n * 10));

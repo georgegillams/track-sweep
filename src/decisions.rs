@@ -13,7 +13,7 @@ pub enum Decision {
     Keep,
     Favourite,
     Unfavourite,
-    Dislike,
+    Remove,
 }
 
 impl Decision {
@@ -22,7 +22,7 @@ impl Decision {
             Self::Keep => "keep",
             Self::Favourite => "favourite",
             Self::Unfavourite => "unfavourite",
-            Self::Dislike => "dislike",
+            Self::Remove => "remove",
         }
     }
 }
