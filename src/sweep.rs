@@ -338,13 +338,13 @@ fn raw_println(msg: &str) -> Result<()> {
 
 fn print_track(index: usize, total: usize, track: &TrackInfo, key_help: &str) -> Result<()> {
     let fav = if track.favorited {
-        format!(" {}", "★".yellow())
+        format!("{} ", "⭐".yellow())
     } else {
         String::new()
     };
     let title = track.name.as_str().bold().blue();
     let line = format!(
-        "\r\n[{index}/{total}] {title} — {} ({}){fav}\r\n  {key_help}\r\n> ",
+        "\r\n[{index}/{total}] {fav}{title} — {} ({})\r\n  {key_help}\r\n> ",
         track.artist, track.album
     );
     print!("{line}");
